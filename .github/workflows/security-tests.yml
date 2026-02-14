@@ -1,0 +1,168 @@
+name: Security Test Suite
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    - cron: '0 3 * * *'  # Nightly at 3 AM UTC
+  workflow_dispatch:
+    inputs:
+      test_scope:
+        description: 'Which tests to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - critical
+          - pickup
+          - bank_info
+          - forget_password
+
+jobs:
+
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      bank_token: ${{ steps.refresh.outputs.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Refresh bank info token
+        id: refresh
+        run: |
+          TOKEN=$(python -c "
+          from framework.token_utils import refresh_bank_info_token
+          t = refresh_bank_info_token('https://stg-app.bosta.co/api/v2')
+          print(t or '')
+          ")
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+  security-tests:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [pickup, bank_info, forget_password]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ${{ matrix.api }} security tests
+        env:
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+          BANK_INFO_AUTH_TOKEN: ${{ needs.setup.outputs.bank_token || secrets.BANK_INFO_AUTH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BASE_URL: ${{ secrets.BASE_URL || 'https://stg-app.bosta.co/api/v2' }}
+        run: |
+          pytest tests/${{ matrix.api }}/ \
+            -v \
+            --tb=short \
+            --html=reports/${{ matrix.api }}_report.html \
+            --self-contained-html \
+            --junitxml=reports/${{ matrix.api }}_results.xml \
+            || true
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.api }}-security-report
+          path: reports/
+          retention-days: 30
+
+  critical-tests:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run critical security tests only
+        env:
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+          BANK_INFO_AUTH_TOKEN: ${{ needs.setup.outputs.bank_token || secrets.BANK_INFO_AUTH_TOKEN }}
+          BASE_URL: ${{ secrets.BASE_URL || 'https://stg-app.bosta.co/api/v2' }}
+        run: |
+          pytest tests/ \
+            -v \
+            -m critical \
+            --tb=short \
+            --maxfail=5 \
+            --junitxml=reports/critical_results.xml \
+            || true
+
+      - name: Upload critical test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: critical-security-report
+          path: reports/
+          retention-days: 30
+
+  summary:
+    needs: [security-tests, critical-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports/
+
+      - name: Generate summary
+        run: |
+          echo "## Security Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| API | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          for api in pickup bank_info forget_password; do
+            if [ -f "all-reports/${api}-security-report/${api}_results.xml" ]; then
+              TESTS=$(grep -o 'tests="[0-9]*"' "all-reports/${api}-security-report/${api}_results.xml" | head -1 | grep -o '[0-9]*')
+              FAILURES=$(grep -o 'failures="[0-9]*"' "all-reports/${api}-security-report/${api}_results.xml" | head -1 | grep -o '[0-9]*')
+              ERRORS=$(grep -o 'errors="[0-9]*"' "all-reports/${api}-security-report/${api}_results.xml" | head -1 | grep -o '[0-9]*')
+              echo "| ${api} | Tests: ${TESTS:-0}, Failures: ${FAILURES:-0}, Errors: ${ERRORS:-0} |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| ${api} | No results found |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### OWASP Top 10 Coverage" >> $GITHUB_STEP_SUMMARY
+          echo "- A01: Broken Access Control (auth bypass, IDOR, privilege escalation)" >> $GITHUB_STEP_SUMMARY
+          echo "- A02: Cryptographic Failures (JWT analysis, alg-none attack)" >> $GITHUB_STEP_SUMMARY
+          echo "- A03: Injection (SQL, NoSQL, XSS, LDAP, SSRF)" >> $GITHUB_STEP_SUMMARY
+          echo "- A04: Insecure Design (business logic, OTP bypass)" >> $GITHUB_STEP_SUMMARY
+          echo "- A05: Security Misconfiguration (headers, error handling)" >> $GITHUB_STEP_SUMMARY
+          echo "- A07: Authentication Failures (token manipulation, enumeration)" >> $GITHUB_STEP_SUMMARY
+          echo "- A08: Data Integrity (race conditions, mass assignment)" >> $GITHUB_STEP_SUMMARY
